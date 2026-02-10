@@ -180,18 +180,8 @@ class zteClient:
         if self.model not in _TT_MODELS:
             self._tt_firmware = False
             return False
-        try:
-            r = requests.get(
-                f"http://{self.host}/",
-                params={"_type": "loginData", "_tag": "login_entry"},
-                timeout=5,
-            )
-            r.raise_for_status()
-            data = r.json()
-            self._tt_firmware = bool(data.get("sess_token"))
-        except Exception:
-            self._tt_firmware = False
-        return self._tt_firmware
+        # Defer detection to login fallback for stability.
+        return False
 
     @staticmethod
     def _tt_extract_login_token(text: str) -> str:
@@ -568,7 +558,9 @@ class zteClient:
 
             r = self.session.get(
                 f"http://{self.host}/",
-                params={"_type": "menuData", "_tag": "Localnet_Lan_Clinet_lua.lua"},
+                params=self._tt_with_session_token(
+                    {"_type": "menuData", "_tag": "Localnet_Lan_Clinet_lua.lua"}
+                ),
                 timeout=10,
             )
             if self._tt_is_session_timeout(r.text) and self._tt_session_token:
@@ -603,7 +595,9 @@ class zteClient:
             for params in params_list:
                 try:
                     r = self.session.get(
-                        f"http://{self.host}/", params=params, timeout=10
+                        f"http://{self.host}/",
+                        params=self._tt_with_session_token(params),
+                        timeout=10,
                     )
                     if self._tt_is_session_timeout(r.text) and self._tt_session_token:
                         r = self.session.get(
@@ -628,6 +622,11 @@ class zteClient:
 
     def login(self) -> bool:
         """Login procedure using ZTE challenge. Returns True if successful, False otherwise. Sets statusmsg for error reporting."""
+        if self.model in _TT_MODELS and self._tt_firmware is None:
+            if self._tt_login():
+                self._tt_firmware = True
+                return True
+            self._tt_firmware = False
         if self._detect_tt_firmware():
             return self._tt_login()
         try:
