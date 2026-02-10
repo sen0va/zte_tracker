@@ -322,6 +322,31 @@ class zteClient:
             self._tt_ssid_map = None
             self._tt_session_token = None
 
+    def _tt_try_fallback(self, error: Exception) -> bool:
+        """Attempt TT fallback after retail endpoints return SessionTimeout."""
+        if self.model not in _TT_MODELS:
+            return False
+        if "SessionTimeout" not in str(error):
+            return False
+        _LOGGER.info(
+            "SessionTimeout on retail endpoints for %s; trying TT backend.",
+            self.host,
+        )
+        # Clear retail session before switching to TT flow.
+        if self.session:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+        self.session = None
+        self.login_data = None
+        self._tt_firmware = True
+        if self._tt_login():
+            return True
+        # TT login failed; revert so retail can continue.
+        self._tt_firmware = False
+        return False
+
     @staticmethod
     def _tt_parse_instances(group: ET.Element) -> list[dict[str, str]]:
         devices: list[dict[str, str]] = []
@@ -838,6 +863,8 @@ class zteClient:
             return devices
 
         except Exception as e:
+            if self._tt_try_fallback(e):
+                return self._tt_get_lan_devices()
             self.statusmsg = f"Failed to get LAN devices: {e}"
             _LOGGER.error(self.statusmsg)
             return None
@@ -876,6 +903,8 @@ class zteClient:
             return devices
 
         except Exception as e:
+            if self._tt_try_fallback(e):
+                return self._tt_get_wifi_devices()
             self.statusmsg = f"Failed to get WiFi devices: {e}"
             _LOGGER.error(self.statusmsg)
             return None
