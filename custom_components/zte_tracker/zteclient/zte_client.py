@@ -8,6 +8,7 @@ from os import error
 import base64
 import hashlib
 import logging
+import re
 import time
 from typing import Any
 import warnings
@@ -84,6 +85,8 @@ _MODELS["SR7410"] = _MODELS["E2631"]
 _MODELS["SR7110"] = _MODELS["E2631"]
 _MODELS["F680"] = _MODELS["F6640"]
 
+_TT_MODELS = {"H3600P"}
+
 
 class zteClient:
     """ZTE router client with improved security and reliability."""
@@ -114,6 +117,8 @@ class zteClient:
         self.model = model
         self.paths = _MODELS[model]
         self.verify_ssl = verify_ssl
+        self._tt_firmware: bool | None = None
+        self._tt_ssid_map: dict[str, str] | None = None
 
     @staticmethod
     def get_models() -> list[str]:
@@ -144,8 +149,429 @@ class zteClient:
         )
         # self.session.cookies.set("_TESTCOOKIESUPPORT", "1")
 
+    def _setup_tt_session(self) -> None:
+        """Set up HTTP session for Turk Telekom firmware."""
+        self.session = Session()
+
+        retry_strategy = Retry(
+            total=0,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        self.session.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": f"http://{self.host}/",
+                "Accept": "application/xml, text/xml, */*; q=0.01",
+            }
+        )
+
+    def _detect_tt_firmware(self) -> bool:
+        """Detect Turk Telekom firmware for H3600P models."""
+        if self._tt_firmware is not None:
+            return self._tt_firmware
+        if self.model not in _TT_MODELS:
+            self._tt_firmware = False
+            return False
+        try:
+            r = requests.get(
+                f"http://{self.host}/",
+                params={"_type": "loginData", "_tag": "login_entry"},
+                timeout=5,
+            )
+            r.raise_for_status()
+            data = r.json()
+            self._tt_firmware = bool(data.get("sess_token"))
+        except Exception:
+            self._tt_firmware = False
+        return self._tt_firmware
+
+    @staticmethod
+    def _tt_extract_login_token(text: str) -> str:
+        """Extract login token from XML or plaintext responses."""
+        try:
+            xml_response = ET.fromstring(text)
+            token = "".join(xml_response.itertext()).strip()
+        except Exception:
+            token = re.sub(r"[^0-9,]", "", text).strip()
+        return token
+
+    def _tt_fetch_login_entry(self) -> dict[str, Any]:
+        if not self.session:
+            raise RuntimeError("Session not initialized")
+        r = self.session.get(
+            f"http://{self.host}/",
+            params={"_type": "loginData", "_tag": "login_entry"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("sess_token"):
+            raise RuntimeError("Session token missing in login_entry response")
+        return data
+
+    def _tt_fetch_login_token(self) -> str:
+        if not self.session:
+            raise RuntimeError("Session not initialized")
+        r = self.session.get(
+            f"http://{self.host}/",
+            params={"_type": "loginData", "_tag": "login_token"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        token = self._tt_extract_login_token(r.text)
+        if not token:
+            raise RuntimeError("Empty login_token received from router")
+        return token
+
+    def _tt_login(self) -> bool:
+        """Login flow for Turk Telekom firmware."""
+        try:
+            if self.login_data is not None and self.session is not None:
+                return True
+
+            self._setup_tt_session()
+            entry = self._tt_fetch_login_entry()
+            login_token = self._tt_fetch_login_token()
+
+            pass_hash = f"{self.password}{login_token}"
+            password_param = hashlib.sha256(pass_hash.encode()).hexdigest()
+
+            r = self.session.post(
+                f"http://{self.host}/",
+                params={"_type": "loginData", "_tag": "login_entry"},
+                data={
+                    "action": "login",
+                    "Password": password_param,
+                    "Username": self.username,
+                    "_sessionTOKEN": entry.get("sess_token"),
+                },
+                timeout=10,
+            )
+            self.log_request(r)
+            r.raise_for_status()
+            try:
+                self.login_data = r.json()
+            except Exception:
+                self.login_data = {}
+
+            if self.login_data.get("lockingTime", 0) == -1:
+                self.statusmsg = (
+                    f"Router is locked: {self.login_data.get('loginErrMsg', 'Unknown error')}"
+                )
+                return False
+            if self.login_data.get("lockingTime", 0) > 0:
+                self.statusmsg = (
+                    f"Router is locked for {self.login_data.get('lockingTime', 0)} seconds: Too many login errors."
+                )
+                return False
+
+            if (
+                self.login_data is not None
+                and "loginErrMsg" in self.login_data
+                and self.login_data["loginErrMsg"]
+                and "password" in self.login_data["loginErrMsg"].lower()
+            ):
+                self.statusmsg = f"Login denied: {self.login_data['loginErrMsg']}"
+                return False
+
+            login_result = self.login_data.get("login_result")
+            if login_result and login_result not in ("success", "SUCC"):
+                self.statusmsg = f"Login failed: {login_result}"
+                return False
+
+            self.statusmsg = "Login successful."
+            return True
+        except Exception as e:
+            self.statusmsg = f"Failed login: {e}"
+            _LOGGER.error(self.statusmsg)
+            self.login_data = None
+            if self.session:
+                self.session.close()
+                self.session = None
+            return False
+
+    def _tt_logout(self) -> None:
+        """Logout for Turk Telekom firmware."""
+        try:
+            if self.login_data is None or not self.session:
+                return
+            r = self.session.post(
+                f"http://{self.host}/",
+                params={"_type": "loginData", "_tag": "logout_entry"},
+                data={"IF_LogOff": "1"},
+                timeout=10,
+            )
+            self.log_request(r)
+            r.raise_for_status()
+        except Exception as e:
+            _LOGGER.error("Failed to logout: %s", e)
+        finally:
+            if self.session:
+                self.session.close()
+                self.session = None
+            self.login_data = None
+            self._tt_ssid_map = None
+
+    @staticmethod
+    def _tt_parse_instances(group: ET.Element) -> list[dict[str, str]]:
+        devices: list[dict[str, str]] = []
+        for inst in group.findall("Instance"):
+            entry: dict[str, str] = {}
+            children = list(inst)
+            for i in range(0, len(children), 2):
+                name_el = children[i]
+                value_el = children[i + 1] if i + 1 < len(children) else None
+                if name_el.tag != "ParaName":
+                    continue
+                name = (name_el.text or "").strip()
+                value = ""
+                if (
+                    value_el is not None
+                    and value_el.tag == "ParaValue"
+                    and value_el.text is not None
+                ):
+                    value = value_el.text.strip()
+                if name:
+                    entry[name] = value
+            if entry:
+                devices.append(entry)
+        return devices
+
+    @staticmethod
+    def _tt_find_group(
+        root: ET.Element, preferred: str, contains: str
+    ) -> ET.Element:
+        group = root.find(preferred)
+        if group is not None:
+            return group
+        for child in root:
+            if isinstance(child.tag, str) and contains in child.tag.upper():
+                return child
+        raise RuntimeError(f"Group {preferred} not found in XML response")
+
+    def _tt_parse_devices(
+        self, xml_response: str, group_tag: str, contains: str, network_type: str
+    ) -> list[dict[str, Any]]:
+        devices: list[dict[str, Any]] = []
+
+        if not xml_response.strip():
+            return devices
+
+        xml = ET.fromstring(xml_response)
+        error_str = xml.findtext("IF_ERRORSTR")
+        if error_str and error_str not in ("SUCC", "SUCCESS", "OK"):
+            raise Exception(f"Router error: {error_str}")
+
+        group = self._tt_find_group(xml, group_tag, contains)
+        raw_entries = self._tt_parse_instances(group)
+        ssid_map = self._tt_get_ssid_map() if network_type == "WLAN" else {}
+
+        for entry in raw_entries:
+            device_info: dict[str, Any] = {
+                "Active": True,
+                "IconType": None,
+                "NetworkType": network_type,
+                "MACAddress": "",
+                "IPAddress": "",
+                "HostName": "",
+                "Port": "",
+                "LinkTime": "",
+                "ConnectTime": "",
+            }
+
+            for name, value in entry.items():
+                if name in ("IPAddr", "IPAddress"):
+                    device_info["IPAddress"] = value
+                elif name in ("MACAddr", "MACAddress"):
+                    device_info["MACAddress"] = value.upper()
+                elif name == "HostName":
+                    device_info["HostName"] = value
+                elif name in ("PhyPortName", "AliasName"):
+                    device_info["Port"] = value
+                elif name == "Active":
+                    device_info["Active"] = value.lower() in ("1", "true", "yes")
+                elif name == "IconType":
+                    device_info["IconType"] = value
+                elif name == "LinkTime":
+                    device_info["LinkTime"] = value
+                elif name == "ConnectTime":
+                    device_info["ConnectTime"] = value
+
+            port = device_info.get("Port")
+            if port and port in ssid_map:
+                device_info["Port"] = ssid_map[port]
+
+            if device_info["MACAddress"]:
+                devices.append(device_info)
+
+        return devices
+
+    def _tt_get_ssid_map(self) -> dict[str, str]:
+        if self._tt_ssid_map is not None:
+            return self._tt_ssid_map
+        self._tt_ssid_map = {}
+        if not self.session:
+            return self._tt_ssid_map
+
+        base = f"http://{self.host}/"
+        candidates = [
+            {"_type": "menuData", "_tag": "wlan_sssidconf_encryoption_lua.lua"},
+            {"_type": "menuData", "_tag": "wlan_ssidconf_encryoption_lua.lua"},
+            {"_type": "menuData", "_tag": "wlan_homepage_lua.lua", "InstNum": "0"},
+            {"_type": "menuData", "_tag": "wlan_homepage_lua.lua", "flag": "0"},
+        ]
+        for params in candidates:
+            try:
+                r = self.session.get(base, params=params, timeout=10)
+                r.raise_for_status()
+                root = ET.fromstring(r.text)
+            except Exception:
+                continue
+
+            ssid_map: dict[str, str] = {}
+            group = root.find("OBJ_WLANAP_ID")
+            if group is not None:
+                for inst in group.findall("Instance"):
+                    alias = None
+                    essid = None
+                    children = list(inst)
+                    for i in range(0, len(children), 2):
+                        name_el = children[i]
+                        value_el = children[i + 1] if i + 1 < len(children) else None
+                        if name_el.tag != "ParaName":
+                            continue
+                        name = (name_el.text or "").strip()
+                        value = ""
+                        if (
+                            value_el is not None
+                            and value_el.tag == "ParaValue"
+                            and value_el.text is not None
+                        ):
+                            value = value_el.text.strip()
+                        if name == "Alias":
+                            alias = value
+                        elif name == "ESSID":
+                            essid = value
+                    if alias and essid:
+                        ssid_map[alias] = essid
+
+            if not ssid_map:
+                for group in root:
+                    tag = group.tag.upper() if isinstance(group.tag, str) else ""
+                    if "SSID" not in tag:
+                        continue
+                    for inst in group.findall("Instance"):
+                        params_dict: dict[str, str] = {}
+                        children = list(inst)
+                        for i in range(0, len(children), 2):
+                            name_el = children[i]
+                            value_el = children[i + 1] if i + 1 < len(children) else None
+                            if name_el.tag != "ParaName":
+                                continue
+                            name = (name_el.text or "").strip()
+                            value = ""
+                            if (
+                                value_el is not None
+                                and value_el.tag == "ParaValue"
+                                and value_el.text is not None
+                            ):
+                                value = value_el.text.strip()
+                            params_dict[name] = value
+                        inst_id = params_dict.get("_InstID")
+                        ssid_key = None
+                        if inst_id and ".Ssid" in inst_id:
+                            ssid_key = "SSID" + inst_id.split(".Ssid")[-1]
+                        if not ssid_key:
+                            idx = params_dict.get("Index") or params_dict.get("Idx")
+                            if idx and idx.isdigit():
+                                ssid_key = f"SSID{idx}"
+                        ssid_name = params_dict.get("SSIDName") or params_dict.get(
+                            "SsidName"
+                        )
+                        if ssid_key and ssid_name:
+                            ssid_map[ssid_key] = ssid_name
+
+            if ssid_map:
+                self._tt_ssid_map = ssid_map
+                return self._tt_ssid_map
+
+        return self._tt_ssid_map
+
+    def _tt_get_lan_devices(self) -> list[dict[str, Any]] | None:
+        try:
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+
+            try:
+                self.session.get(
+                    f"http://{self.host}/",
+                    params={
+                        "_type": "menuView",
+                        "_tag": "lanMgrIpv4",
+                        "Menu3Location": "0",
+                    },
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+            r = self.session.get(
+                f"http://{self.host}/",
+                params={"_type": "menuData", "_tag": "Localnet_Lan_Clinet_lua.lua"},
+                timeout=10,
+            )
+            self.log_request(r)
+            r.raise_for_status()
+            devices = self._tt_parse_devices(
+                r.text, "OBJ_LANGROUPSTATUS_ID", "LANGROUP", "LAN"
+            )
+            self.statusmsg = "OK"
+            return devices
+        except Exception as e:
+            self.statusmsg = f"Failed to get LAN devices: {e}"
+            _LOGGER.error(self.statusmsg)
+            return None
+
+    def _tt_get_wifi_devices(self) -> list[dict[str, Any]] | None:
+        try:
+            if not self.session:
+                raise RuntimeError("Session not initialized")
+
+            params_list = [
+                {"_type": "menuData", "_tag": "wlan_homepage_lua.lua", "InstNum": "5"},
+                {"_type": "menuData", "_tag": "wlan_homepage_lua.lua"},
+            ]
+            for params in params_list:
+                try:
+                    r = self.session.get(
+                        f"http://{self.host}/", params=params, timeout=10
+                    )
+                    r.raise_for_status()
+                    self.log_request(r)
+                    devices = self._tt_parse_devices(
+                        r.text, "OBJ_ACCESSDEV_ID", "ACCESSDEV", "WLAN"
+                    )
+                    self.statusmsg = "OK"
+                    return devices
+                except Exception:
+                    continue
+            return []
+        except Exception as e:
+            self.statusmsg = f"Failed to get WiFi devices: {e}"
+            _LOGGER.error(self.statusmsg)
+            return None
+
     def login(self) -> bool:
         """Login procedure using ZTE challenge. Returns True if successful, False otherwise. Sets statusmsg for error reporting."""
+        if self._detect_tt_firmware():
+            return self._tt_login()
         try:
             # Check if we are logged in already.
             if self.login_data is not None and self.session is not None:
@@ -278,6 +704,9 @@ class zteClient:
 
     def get_session_token(self) -> str:
         """Get session token from router."""
+        if self._detect_tt_firmware():
+            entry = self._tt_fetch_login_entry()
+            return entry["sess_token"]
         if not self.session:
             raise RuntimeError("Session not initialized")
 
@@ -299,6 +728,9 @@ class zteClient:
 
     def logout(self) -> None:
         """Logout from router."""
+        if self._detect_tt_firmware():
+            self._tt_logout()
+            return
         try:
             # Check if we are logged in.
             if self.login_data is None or not self.session:
@@ -347,6 +779,8 @@ class zteClient:
 
     def get_lan_devices(self) -> list[dict[str, Any]] | None:
         """Get the list of devices connected to the LAN ports."""
+        if self._detect_tt_firmware():
+            return self._tt_get_lan_devices()
         try:
             if not self.session:
                 raise RuntimeError("Session not initialized")
@@ -377,6 +811,8 @@ class zteClient:
 
     def get_wifi_devices(self) -> list[dict[str, Any]] | None:
         """Get the list of devices connected to the wifi."""
+        if self._detect_tt_firmware():
+            return self._tt_get_wifi_devices()
         try:
             if not self.session:
                 raise RuntimeError("Session not initialized")
@@ -413,6 +849,9 @@ class zteClient:
 
     def get_router_details(self) -> dict[str, Any] | None:
         """Get router details."""
+        if self._detect_tt_firmware():
+            _LOGGER.debug("Router details not available for Turk Telekom firmware")
+            return {}
         if not getattr(self, "query_router_details", True):
             _LOGGER.debug("Router details query disabled by client flag")
             return {}
@@ -479,6 +918,9 @@ class zteClient:
 
     def get_wan_status(self) -> dict[str, Any]:
         """Fetch WAN status and return relevant attributes."""
+        if self._detect_tt_firmware():
+            _LOGGER.debug("WAN status not available for Turk Telekom firmware")
+            return {}
         if not getattr(self, "query_wan_status", True):
             _LOGGER.debug("WAN status query disabled by client flag")
             return {}
@@ -670,6 +1112,10 @@ class zteClient:
 
     def reboot(self) -> bool:
         """Reboot the router using the secure endpoint."""
+        if self._detect_tt_firmware():
+            self.statusmsg = "Reboot not supported for Turk Telekom firmware."
+            _LOGGER.warning(self.statusmsg)
+            return False
         try:
             if not self.login():
                 _LOGGER.error("Login failed: %s", self.statusmsg)
