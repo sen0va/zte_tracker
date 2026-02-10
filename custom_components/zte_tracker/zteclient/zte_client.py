@@ -119,6 +119,7 @@ class zteClient:
         self.verify_ssl = verify_ssl
         self._tt_firmware: bool | None = None
         self._tt_ssid_map: dict[str, str] | None = None
+        self._tt_session_token: str | None = None
 
     @staticmethod
     def get_models() -> list[str]:
@@ -238,6 +239,7 @@ class zteClient:
 
             self._setup_tt_session()
             entry = self._tt_fetch_login_entry()
+            self._tt_session_token = entry.get("sess_token")
             login_token = self._tt_fetch_login_token()
 
             pass_hash = f"{self.password}{login_token}"
@@ -318,6 +320,7 @@ class zteClient:
                 self.session = None
             self.login_data = None
             self._tt_ssid_map = None
+            self._tt_session_token = None
 
     @staticmethod
     def _tt_parse_instances(group: ET.Element) -> list[dict[str, str]]:
@@ -504,6 +507,22 @@ class zteClient:
 
         return self._tt_ssid_map
 
+    @staticmethod
+    def _tt_is_session_timeout(xml_text: str) -> bool:
+        try:
+            xml = ET.fromstring(xml_text)
+            error_str = xml.findtext("IF_ERRORSTR") or ""
+            return "sessiontimeout" in error_str.lower()
+        except Exception:
+            return False
+
+    def _tt_with_session_token(self, params: dict[str, str]) -> dict[str, str]:
+        if not self._tt_session_token:
+            return params
+        with_token = dict(params)
+        with_token["_sessionTOKEN"] = self._tt_session_token
+        return with_token
+
     def _tt_get_lan_devices(self) -> list[dict[str, Any]] | None:
         try:
             if not self.session:
@@ -527,6 +546,14 @@ class zteClient:
                 params={"_type": "menuData", "_tag": "Localnet_Lan_Clinet_lua.lua"},
                 timeout=10,
             )
+            if self._tt_is_session_timeout(r.text) and self._tt_session_token:
+                r = self.session.get(
+                    f"http://{self.host}/",
+                    params=self._tt_with_session_token(
+                        {"_type": "menuData", "_tag": "Localnet_Lan_Clinet_lua.lua"}
+                    ),
+                    timeout=10,
+                )
             self.log_request(r)
             r.raise_for_status()
             devices = self._tt_parse_devices(
@@ -553,6 +580,12 @@ class zteClient:
                     r = self.session.get(
                         f"http://{self.host}/", params=params, timeout=10
                     )
+                    if self._tt_is_session_timeout(r.text) and self._tt_session_token:
+                        r = self.session.get(
+                            f"http://{self.host}/",
+                            params=self._tt_with_session_token(params),
+                            timeout=10,
+                        )
                     r.raise_for_status()
                     self.log_request(r)
                     devices = self._tt_parse_devices(
