@@ -7,6 +7,7 @@ from os import error
 
 import base64
 import hashlib
+from html.parser import HTMLParser
 import json
 import logging
 import re
@@ -141,6 +142,28 @@ _MODELS["F680"] = {
     **_MODELS["F6640"],
     "tag_parentctrl_view": "parentCtrl&Menu3Location=0",
     "tag_parentctrl_data": "firewall_parentctrl_lua.lua",
+}
+# ZTE H3600P - Turk Telekom firmware variant. The retail H3600P alias
+# above (HTTPS, accessdev_ssiddev_lua.lua/accessdev_landevs_lua.lua) does
+# not match this firmware: it serves plain HTTP only, exposes a single
+# OBJ_ACCESSDEV_ID list for both LAN and Wi-Fi via
+# accessdev_homepage_lua.lua / wlan_homepage_lua.lua (InstNum=1000), skips
+# the menuView/localNetStatus priming step, preempts a stuck existing Web
+# UI session on login (loginErrType e_exceed_max_user_preempt) instead of
+# just rejecting it, and needs an explicit root reload after any
+# successful login (normal or takeover) plus a fresh session token on
+# logout. Kept as a distinct, explicitly selected model so auto-detect
+# never imposes HTTP or these quirks on the retail H3600P.
+_MODELS["H3600P-TT"] = {
+    "wlan_script": "wlan_homepage_lua.lua&InstNum=1000",
+    "wlan_id_element": "OBJ_ACCESSDEV_ID",
+    "lan_script": "accessdev_homepage_lua.lua&InstNum=1000",
+    "lan_id_element": "OBJ_ACCESSDEV_ID",
+    "type_first_request": "menuView",
+    "type_main_request": "menuData",
+    "default_scheme": "http",
+    "skip_first_request": True,
+    "tt_session_quirks": True,
 }
 
 
@@ -401,6 +424,28 @@ class zteClient:
             ):
                 self.statusmsg = f"Login denied: {self.login_data['loginErrMsg']}"
                 return False
+            if self.paths.get("tt_session_quirks"):
+                error_type = self.login_data.get("loginErrType") or ""
+                if error_type == "e_exceed_max_user_preempt":
+                    if not self._preempt_session():
+                        self.statusmsg = "Login denied: another active session could not be taken over."
+                        return False
+                elif error_type:
+                    self.statusmsg = f"Login denied: {self.login_data.get('loginErrMsg') or error_type}"
+                    return False
+                elif self.login_data.get("login_need_refresh") not in (0, 1):
+                    # No recognizable success signal (e.g. an empty JSON body) -
+                    # fail rather than fall through to a false "successful".
+                    self.statusmsg = "Router did not confirm login."
+                    return False
+                try:
+                    # Both a normal and a takeover login need a root reload to
+                    # establish menu context before device-list requests work.
+                    self.session.get(
+                        f"{self.base_url}/", verify=self.verify_ssl, timeout=10
+                    )
+                except Exception:
+                    pass  # Best-effort; subsequent requests fail loudly if the session is bad.
 
             self.statusmsg = "Login successful."
             return True
@@ -411,6 +456,52 @@ class zteClient:
             if self.session:
                 self.session.close()
                 self.session = None
+            return False
+
+    class _PreemptInputs(HTMLParser):
+        """Read the first session choice, including unquoted HTML attributes."""
+
+        sessid: str | None = None
+
+        def handle_starttag(self, tag, attrs):
+            fields = dict(attrs)
+            if (
+                tag == "input"
+                and fields.get("name") == "preempt_sessid"
+                and self.sessid is None
+            ):
+                self.sessid = fields.get("value")
+
+    def _preempt_session(self) -> bool:
+        """Take over a stuck existing Web UI session, as the router's own UI does."""
+        try:
+            page = self.session.get(
+                f"{self.base_url}/", verify=self.verify_ssl, timeout=10
+            )
+            page.raise_for_status()
+            inputs = self._PreemptInputs()
+            inputs.feed(page.text)
+            sessid = inputs.sessid
+            if not sessid:
+                return False
+            r = self.session.post(
+                f"{self.base_url}/?_type=loginData&_tag=login_preempt",
+                data={"preempt_sessid": sessid, "action": "preempt"},
+                verify=self.verify_ssl,
+                timeout=10,
+            )
+            self.log_request(r)
+            r.raise_for_status()
+            result = r.json()
+            self.login_data = result
+            if result.get("loginErrType"):
+                return False
+            return bool(
+                result.get("login_need_refresh")
+                or result.get("login_result") in ("SUCC", "success")
+            )
+        except Exception as e:
+            _LOGGER.error("Session preempt failed: %s", e)
             return False
 
     def get_guid(self) -> int:
@@ -447,9 +538,15 @@ class zteClient:
             if self.login_data is None or not self.session:
                 return
 
+            data = {"IF_LogOff": "1"}
+            if self.paths.get("tt_session_quirks"):
+                try:
+                    data["_sessionTOKEN"] = self.get_session_token()
+                except Exception:
+                    pass  # Best-effort; logout still fires without a fresh token.
             r = self.session.post(
                 f"{self.base_url}?_type=loginData&_tag=logout_entry",
-                data={"IF_LogOff": "1"},
+                data=data,
                 verify=self.verify_ssl,
                 timeout=10,
             )
@@ -492,14 +589,17 @@ class zteClient:
             if not self.session:
                 raise RuntimeError("Session not initialized")
 
-            # First request to set up context
-            r = self.session.get(
-                f"{self.base_url}/?_type={self.paths['type_first_request']}&_tag=localNetStatus&_={self.get_guid()}",
-                verify=self.verify_ssl,
-                timeout=10,
-            )
-            self.log_request(r)
-            r.raise_for_status()
+            # First request to set up context. Skipped on profiles whose
+            # firmware serves the device list directly (TT H3600P): the
+            # extra request is either unsupported or simply unnecessary there.
+            if not self.paths.get("skip_first_request"):
+                r = self.session.get(
+                    f"{self.base_url}/?_type={self.paths['type_first_request']}&_tag=localNetStatus&_={self.get_guid()}",
+                    verify=self.verify_ssl,
+                    timeout=10,
+                )
+                self.log_request(r)
+                r.raise_for_status()
 
             # Main request for LAN devices
             lan_request = f"{self.base_url}/?_type={self.paths['type_main_request']}&_tag={self.paths['lan_script']}&_={self.get_guid()}"

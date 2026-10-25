@@ -38,12 +38,14 @@
             "data": {
               "host": "Router IP Address",
               "username": "Username",
-              "password": "Password"
+              "password": "Password",
+              "model": "Router Model"
             },
             "data_description": {
               "host": "IP address or hostname of the router.",
               "username": "Router web UI user name.",
-              "password": "Router web UI password."
+              "password": "Router web UI password.",
+              "model": "Changing this re-validates the connection and reloads the integration; existing devices and history are kept."
             }
           },
           "data_sources": {
@@ -82,6 +84,7 @@
       "invalid_host": "Invalid host address",
       "invalid_username": "Invalid username",
       "invalid_password": "Invalid password",
+      "invalid_model": "Selected router model is not supported.",
       "unknown": "Unexpected error occurred"
     }
   },

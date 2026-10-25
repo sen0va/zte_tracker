@@ -311,10 +311,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             new_host = user_input.get(CONF_HOST, current_host)
             new_username = user_input.get(CONF_USERNAME, current_username)
             new_password = user_input.get(CONF_PASSWORD, current_password)
+            new_model = user_input.get(CONF_MODEL, current_model)
             credentials_changed = (
                 new_host != current_host
                 or new_username != current_username
                 or new_password != current_password
+                or new_model != current_model
             )
 
             # Per-field validation (mirrors async_step_user)
@@ -330,6 +332,8 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 new_password = validate_password(new_password)
             except vol.Invalid:
                 errors[CONF_PASSWORD] = "invalid_password"
+            if new_model not in zteClient.get_models():
+                errors[CONF_MODEL] = "invalid_model"
             new_scan_interval = _parse_scan_interval(
                 user_input.get(CONF_SCAN_INTERVAL), current_scan_interval
             )
@@ -345,7 +349,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                                 CONF_HOST: new_host,
                                 CONF_USERNAME: new_username,
                                 CONF_PASSWORD: new_password,
-                                CONF_MODEL: current_model,
+                                CONF_MODEL: new_model,
                                 CONF_QUERY_WAN_STATUS: bool(
                                     user_input.get(
                                         CONF_QUERY_WAN_STATUS, current_wan
@@ -380,6 +384,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             CONF_HOST: new_host,
                             CONF_USERNAME: new_username,
                             CONF_PASSWORD: new_password,
+                            CONF_MODEL: new_model,
                         }
                         self.hass.config_entries.async_update_entry(
                             self._config_entry, data=new_data
@@ -427,6 +432,7 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             current_host = new_host
             current_username = new_username
             current_password = new_password
+            current_model = new_model
             current_wan = bool(user_input.get(CONF_QUERY_WAN_STATUS, current_wan))
             current_router = bool(
                 user_input.get(CONF_QUERY_ROUTER_DETAILS, current_router)
@@ -454,6 +460,9 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             vol.Required(
                                 CONF_PASSWORD, default=current_password
                             ): cv.string,
+                            vol.Required(
+                                CONF_MODEL, default=current_model
+                            ): vol.In(zteClient.get_models()),
                         }
                     ),
                     {"collapsed": False},

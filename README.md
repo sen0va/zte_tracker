@@ -208,6 +208,7 @@ For ZTE mesh networks (e.g. F6600P Controller + H196A Agent), enable **Mesh topo
 | ZTE H288A     |      H288A      |    ✅    |
 | ZTE H388X     |      H388X      |    ✅    |
 | ZTE H3600P    |     H3600P      |    ✅    |
+| ZTE H3600P (Turk Telekom firmware) | H3600P-TT |    ✅    |
 | ZTE H3640 V10 |      H3640      |    ✅    |
 | ZTE H6645P V2 |     H6645P      |    ✅    |
 | ZTE H6745 V3  |      H6745      |    ✅    |
@@ -219,6 +220,8 @@ For ZTE mesh networks (e.g. F6600P Controller + H196A Agent), enable **Mesh topo
 > **Not listed?** Try each value above first, then run [`zte_tracker.export_support_bundle`](#zte_trackerexport_support_bundle) and attach the file to an issue.
 
 > **F8748 note**: Verified on a unit provided by **DIGI Portugal** (firmware `V3.0.10P2N4`, hardware `V3.0.03`). It shares the F6640 web-console endpoints, and is defined as a distinct model because this firmware additionally exposes **WAN traffic counters** in `wan_internetstatus_lua.lua`. When the model is `F8748`, the integration parses those into extra router-status attributes: `WAN_rx_bytes`, `WAN_tx_bytes`, `WAN_rx_packets`, `WAN_tx_packets`, `WAN_rx_errors`, `WAN_tx_errors`. This is gated to `F8748` so other F6640-family routers are unaffected (we could not confirm they populate the same fields). DIGI units in other countries (e.g. Spain, Romania) are likely identical; F8748 units from other providers or bought retail may expose additional pages/data we could not confirm.
+
+> **H3600P-TT note**: Some Turk Telekom-branded H3600P units run a firmware that does not match the retail `H3600P` profile above: it serves plain **HTTP** (not HTTPS), lists both LAN and Wi-Fi clients under a single `OBJ_ACCESSDEV_ID` node via `accessdev_homepage_lua.lua`/`wlan_homepage_lua.lua` (`InstNum=1000`), and can return `loginErrType: e_exceed_max_user_preempt` when another browser tab is already logged in - the integration then takes over that session (`login_preempt`) the same way the router's own Web UI does, and reloads the root page after any login (normal or takeover) to establish menu context. This is defined as a distinct, explicitly-selected model (`H3600P-TT`) so auto-detection never forces HTTP or these quirks onto the retail `H3600P`. Existing `H3600P` entries can switch to it from **Settings → Devices & Services → ZTE Router → Configure → Router connection → Router Model** without losing device history.
 
 ## 🚀 Installation
 
@@ -534,6 +537,15 @@ Below are the actual URL sequences used by the integration for the most common Z
   `GET https://[router_ip]/?_type=menuData&_tag=accessdev_ssiddev_lua.lua&_=[guid]`
 - **LAN Devices:**
   `GET https://[router_ip]/?_type=menuData&_tag=accessdev_landevs_lua.lua&_=[guid]`
+
+#### **H3600P-TT**
+
+- **Login:** `GET http://[router_ip]/?_type=loginData&_tag=login_entry` (session token) → `GET http://[router_ip]/?_type=loginData&_tag=login_token` (challenge) → `POST http://[router_ip]/?_type=loginData&_tag=login_entry` with `Password=SHA256(password+token)`. On `loginErrType: e_exceed_max_user_preempt`, reads the `preempt_sessid` from the root page and `POST`s `_type=loginData&_tag=login_preempt` with `action=preempt`. Either way, a final `GET http://[router_ip]/` reloads the root page.
+- **WiFi Devices:**
+  `GET http://[router_ip]/?_type=menuData&_tag=wlan_homepage_lua.lua&InstNum=1000&_=[guid]`
+- **LAN Devices:**
+  `GET http://[router_ip]/?_type=menuData&_tag=accessdev_homepage_lua.lua&InstNum=1000&_=[guid]`
+- **Logout:** `POST http://[router_ip]/?_type=loginData&_tag=logout_entry` with a freshly-fetched `_sessionTOKEN` and `IF_LogOff=1`.
 
 #### **E2631**
 
