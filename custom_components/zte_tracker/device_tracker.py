@@ -98,7 +98,9 @@ async def async_setup_entry(
                             entity.async_write_ha_state()
                         found = True
                         break
-                if not found:
+                # c72 patch: haentities lookup misses already-added entities, so
+                # every poll re-created all trackers ("does not generate unique IDs").
+                if not found and mac not in created_entities:
                     # Skip creating new entity if not allowed, unless the entity
                     # already exists in the Home Assistant entity registry.
                     existing_entity_id = entity_registry.async_get_entity_id(
@@ -140,7 +142,7 @@ async def async_setup_entry(
             if not reg_mac:
                 continue
 
-            if reg_mac in queued_macs:
+            if reg_mac in queued_macs or reg_mac in created_entities:
                 continue
 
             # If an entity object is already present, skip
