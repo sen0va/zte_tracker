@@ -341,6 +341,7 @@ class ZteDeviceTrackerEntity(CoordinatorEntity, ScannerEntity):
         device = devices.get(self._mac, {})
 
         return {
+            "active": self.is_connected,  # c72 patch: keep attrs stable vs _mark_undetected_entities (stops per-poll state churn)
             "mac_address": self._mac,
             "ip_address": device.get("ip"),
             "hostname": device.get("name"),
